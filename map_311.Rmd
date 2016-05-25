@@ -1,0 +1,190 @@
+---
+title: "Binning Lat/Long Data into Shapefile Geospatial Polygons"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This document is a simple tutorial that will allow the user to take any set of Lat/Long points, bin them into regions defined in the geospatial polygons that constitute a shapefile, and then plot the frequency per bin. The process is fairly straightforward, but it requires knowledge of several esoteric mapping commands in R. The tutorial is by no means perfect and the reader is encouraged to visit the following pages which were used in the creation of this document: 
+
+<http://gis.stackexchange.com/questions/64513/checking-if-lng-and-lat-fall-inside-polygons-from-esri-shape-file>
+
+<http://gis.stackexchange.com/questions/63793/how-to-overlay-a-polygon-over-spatialpointsdataframe-and-preserving-the-spdf-dat>
+
+<http://gis.stackexchange.com/questions/141469/how-to-convert-a-spatialpolygon-to-a-saptialpolygonsdataframe-and-add-a-column-t>
+
+<http://r-sig-geo.2731867.n2.nabble.com/point-in-polygon-or-over-help-td7583635.html>
+
+<http://gis.stackexchange.com/questions/110117/counts-the-number-of-points-in-a-polygon-in-r>
+
+## Required Packages and Data
+
+The example that we will walk though takes 311 complaints for Heat/Hot Water from NYC Open Data. These data points were retrieved from:
+
+<https://nycopendata.socrata.com/Social-Services/311-Service-Requests-from-2010-to-Present/erm2-nwe9>
+
+where the complaints were filtered by “HEAT/HOT WATER” prior to download (file 311_Service_Requests_from_2010_to_Present.csv). 
+
+In addition, we use obtained shapefile data of US census tracts by using the tigris package. The tracts can be seen at:
+
+<http://maps.nyc.gov/census/>
+
+
+```{r, message=F, warning=F,eval=FALSE}
+library(maptools) # This package, along with plyr, allow for all the necessary data manipulation
+library(plyr) 
+library(tigris) # Obtain census tract shapefile
+library(viridis) # Package for color scheme
+library(leaflet) # For plotting, ggplot can be used with minor changes to the script
+```
+
+## Preprocess Map Data
+
+The following steps download shapefiles, combine into one large geospatial polygon object, and drop some excess polygons. Understanding these commands isn’t necessary for the overall process so long as you have your own shapefile loaded into R. In our case we end up with the Large SpatialPolygonsDataFrame nyc.
+
+```{r, message=F, warning=F,eval=FALSE}
+nyc <- tracts(state = 'NY', county = c('New York'))
+nyc <- nyc[which(nyc@data$NAMELSAD != "Census Tract 5"),]
+nyc <- nyc[which(nyc@data$NAMELSAD != "Census Tract 1"),]
+nyc <- nyc[which(nyc@data$NAMELSAD != "Census Tract 143"),]
+
+queens <- tracts(state = 'NY', county = c('Queens'))
+queens <- queens[which(queens@data$NAMELSAD != "Census Tract 331"),]
+queens <- queens[which(queens@data$NAMELSAD != "Census Tract 1072.02"),]
+queens <- queens[which(queens@data$NAMELSAD != "Census Tract 716"),]
+queens <- queens[which(queens@data$INTPTLAT != min(queens@data$INTPTLAT)),]
+
+bro <- tracts(state = 'NY', county = c('Kings'))
+bro <- bro[which(bro@data$NAMELSAD != "Census Tract 702.03"),]
+bro <- bro[which(bro@data$NAMELSAD != "Census Tract 702.02"),]
+bro <- bro[which(bro@data$INTPTLAT != min(bro@data$INTPTLAT)),]
+
+bronx <- tracts(state = 'NY', county = c('Bronx'))
+bronx <- bronx[which(bronx@data$NAMELSAD != "Census Tract 1"),]
+
+si <- tracts(state = 'NY', county = c('Richmond'))
+si <- si[which(si@data$NAMELSAD != "Census Tract 9901"),]
+
+nyc <- spRbind(nyc,queens)
+nyc <- spRbind(nyc,bro)
+nyc <- spRbind(nyc,bronx)
+nyc <- spRbind(nyc,si)
+
+nyc@data$NAME <- as.numeric(as.character(nyc@data$NAME ))
+nyc@data <- nyc@data[which(nyc@data$AWATER==0),]
+save(nyc,file="nyc_shapefile.Rda")
+```
+
+## Light Preprocessing of 311 Complaints 
+```{r, message=F, warning=F, eval=FALSE}
+# Read in CSV file of complaints and save to R Data File. The resulting file size 
+# is roughly a magnitude of 10 smaller. 
+#df = read.csv("311_Service_Requests_from_2010_to_Present.csv")
+#save(df,file="311_Service_Requests_from_2010_to_Present.Rda")
+load('311_Service_Requests_from_2010_to_Present.Rda')
+
+heat_hw <- df[,c("Latitude","Longitude","Created.Date")]
+```
+
+## Bin 311 Complaints by Lat/Long and Merge into Large SpatialPolygonsDataFrame
+
+This is where the magic happens. In many ways this is the entire point of the tutorial, so the hand full of steps will be given in exhaustive detail:
+
+```{r, eval=FALSE}
+# Create an extremely simple dataframe whose indices correspond to the unique polygon ids (pid) and the one 
+# variable (ID) to our own set of indices from 1 to the number of polygons.
+pid <- sapply(slot(nyc, "polygons"), function(x) slot(x, "ID")) 
+
+nyc2.df <- data.frame(ID=1:length(nyc), row.names = pid) 
+
+# Create a new SpatialPolygonsDataFrame, nyc2 from the list of polygons provided
+# by nyc2.df and polygon objects from nyc. 
+nyc2 <- SpatialPolygonsDataFrame(nyc,nyc2.df)
+
+# Populate this with the data portion of nyc.
+nyc2@data = nyc@data 
+
+# Drop complaints that do not have lat/long values then strip out all other information
+# in the dataframe with the exception of lat/long pairs.
+complaintsLatLon = na.omit(heat_hw[which(grepl(".+",heat_hw$Created.Date)),])
+complaintsLatLon = complaintsLatLon[,c("Longitude","Latitude")]
+
+# Convert the dataframe into spatial points, then convert to the same projection as nyc.
+coordinates(complaintsLatLon) <- ~ Longitude + Latitude
+proj4string(complaintsLatLon) <- CRS("+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0") 
+ 
+# We're finally ready to bin the complaints into polygons. We use the over function which, among other
+# things, assigns a census tract to each data point. The function table is then used to sum the number
+# of points in each tract. We then convert this table to a dataframe of census tracts and complaint counts.
+overVals <- over(complaintsLatLon,nyc2)
+binnedValues <- table(overVals$NAMELSAD) 
+binnedValues <- as.data.frame(binnedValues)
+
+# Rename the binnedValues dataframe columns so that it shares the variable NAMELSAD with the nyc 
+# Large SpatialPolygonsDataFrame. Then use join to include this data in nyc. If any values
+# have not been assigned (empty bins) assign a value of 0.
+colnames(binnedValues) = c("NAMELSAD",'HEAT_HW')
+nyc@data = join(binnedValues, nyc@data, by = "NAMELSAD",type = "right")
+nyc@data[is.na(nyc@data)] = 0
+
+```
+
+## Plot Binned Heat/Hot Water Complaints
+
+```{r, eval=FALSE}
+
+# Create color palette using the viridis package
+pal <- function(x) {colorNumeric(
+  palette = rev(viridis(max(x),option="magma")),
+  domain = x
+  )
+}
+
+# Plot data
+leaflet(nyc) %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  setView(lat = 40.7, lng = -74.0, zoom = 11) %>%
+  addPolygons(data = nyc, color = pal(nyc@data$HEAT_HW)(nyc@data$HEAT_HW),stroke = TRUE, weight = 1,
+              popup = paste("Heat/Hot Water",nyc@data$HEAT_HW, sep=": "), fillOpacity = 0.7) %>%
+  addLegend(pal = pal(nyc@data$HEAT_HW),
+          values = nyc@data$HEAT_HW,
+          position = "bottomright",
+          title = "Heat/Hot Water")
+```
+
+<br>
+<center>
+
+```{r,  message=F, warning=F, echo = F, fig.width=9.5, fig.height=9}
+library(viridis)
+library(leaflet)
+
+load("nyc.Rda")
+
+# Create color palette using the viridis package
+pal <- function(x) {colorNumeric(
+  palette = rev(viridis(max(x),option="magma")),
+  domain = x
+  )
+}
+
+# Plot data
+leaflet(nyc) %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  setView(lat = 40.7, lng = -74.0, zoom = 11) %>%
+  addPolygons(data = nyc, color = pal(nyc@data$HEAT_HW)(nyc@data$HEAT_HW),stroke = TRUE, weight = 1,
+              popup = paste("Heat/Hot Water",nyc@data$HEAT_HW, sep=": "), fillOpacity = 0.7) %>%
+  addLegend(pal = pal(nyc@data$HEAT_HW),
+            values = nyc@data$HEAT_HW,
+            position = "bottomright",
+            title = "Heat/Hot Water")
+```
+
+</center>
+
+<br>
+<br>
